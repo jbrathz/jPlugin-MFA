@@ -14,63 +14,65 @@ class JMFA_Enroll {
 	const SETUP_TTL = 900;
 
 	/**
-	 * Secret for an in progress enrolment. Reuses the same one until it expires
-	 * so refreshing the page does not invalidate an already scanned QR code.
-	 *
-	 * @param int $user_id User ID.
-	 * @return string|false Base32 secret.
+	 * Start self-service setup in the current WordPress session.
 	 */
-	public static function secret_for_user($user_id) {
-		$user_id = (int) $user_id;
-		$secret  = self::peek_secret($user_id);
+	public static function start($user_id) {
+		$row = JMFA_Store::credential($user_id, true);
+		$key = self::admin_setup_key($user_id);
 
-		if (false !== $secret) {
-			return $secret;
-		}
-
-		$secret = JMFA_TOTP::generate_secret();
-		$sealed = JMFA_Crypto::encrypt($secret);
-
-		if (false === $sealed) {
+		if (!$row || 'enabled' === $row->state || '' === $key) {
 			return false;
 		}
 
-		update_user_meta($user_id, JMFA_Store::META_SETUP, $sealed);
-		update_user_meta($user_id, JMFA_Store::META_SETUP_EXPIRES, time() + self::SETUP_TTL);
+		$sealed = JMFA_Crypto::encrypt(JMFA_TOTP::generate_secret());
 
-		return $secret;
+		return false !== $sealed && set_transient(
+			$key, array('secret' => $sealed, 'generation' => $row->generation), self::SETUP_TTL
+		);
 	}
 
 	/**
-	 * Read a non expired enrolment secret without creating one.
-	 *
-	 * @param int $user_id User ID.
-	 * @return string|false
+	 * Read setup in this session while its credential generation is current.
 	 */
-	public static function peek_secret($user_id) {
-		$user_id = (int) $user_id;
-		$stored  = (string) get_user_meta($user_id, JMFA_Store::META_SETUP, true);
-		$expires = (int) get_user_meta($user_id, JMFA_Store::META_SETUP_EXPIRES, true);
+	public static function admin_setup($user_id) {
+		$key   = self::admin_setup_key($user_id);
+		$setup = '' === $key ? false : get_transient($key);
+		$row   = is_array($setup) ? JMFA_Store::credential($user_id) : false;
 
-		if ('' === $stored || $expires <= time()) {
+		if (!$row || 'enabled' === $row->state || $row->generation !== $setup['generation']) {
 			return false;
 		}
 
-		$plain = JMFA_Crypto::decrypt($stored);
+		$secret = JMFA_Crypto::decrypt($setup['secret']);
 
-		return (is_string($plain) && '' !== $plain) ? $plain : false;
+		return false === $secret ? false : array('secret' => $secret, 'generation' => $row->generation);
+	}
+
+	private static function admin_setup_key($user_id) {
+		$token = wp_get_session_token();
+
+		return '' === $token ? '' : 'jmfa_setup_' . (int) $user_id . '_' . hash('sha256', $token);
+	}
+
+	public static function finish_admin_setup($user_id) {
+		$key = self::admin_setup_key($user_id);
+		if ('' !== $key) {
+			delete_transient($key);
+		}
 	}
 
 	/**
 	 * Confirm an enrolment with one valid code and turn MFA on.
 	 *
-	 * @param int    $user_id User ID.
-	 * @param string $code    Six digit code from the app.
+	 * @param int          $user_id    User ID.
+	 * @param string       $code       Six digit code from the app.
+	 * @param string       $generation Credential generation from setup.
+	 * @param string|false $secret     Setup secret.
+	 * @param object|null  $pending    Native login challenge, if any.
 	 * @return array|WP_Error Plain recovery codes on success.
 	 */
-	public static function confirm($user_id, $code) {
+	public static function confirm($user_id, $code, $generation, $secret, $pending = null) {
 		$user_id = (int) $user_id;
-		$secret  = self::peek_secret($user_id);
 
 		if (false === $secret) {
 			return new WP_Error('jmfa_no_setup', __('หน้าการตั้งค่าหมดอายุแล้ว กรุณาเริ่มตั้งค่าใหม่', 'jplugin-mfa'));
@@ -84,7 +86,7 @@ class JMFA_Enroll {
 
 		$codes = JMFA_Store::generate_recovery_codes();
 
-		if (!JMFA_Store::enable($user_id, $secret, $step, $codes)) {
+		if (!JMFA_Store::enable($user_id, $generation, $secret, $step, $codes, $pending)) {
 			return new WP_Error('jmfa_save', __('บันทึกการตั้งค่าไม่สำเร็จ กรุณาลองใหม่', 'jplugin-mfa'));
 		}
 
@@ -106,15 +108,22 @@ class JMFA_Enroll {
 	 * Turn MFA off and drop the user's other sessions.
 	 *
 	 * @param int  $user_id      User ID.
-	 * @param bool $keep_current Keep the session that made the request.
+	 * @param bool        $keep_current Keep the session that made the request.
+	 * @param string|null $generation   Expected credential for self-service.
+	 * @return bool
 	 */
-	public static function disable($user_id, $keep_current = false) {
+	public static function disable($user_id, $keep_current = false, $generation = null) {
 		$user_id = (int) $user_id;
 
-		JMFA_Store::disable($user_id);
+		if (!JMFA_Store::disable($user_id, $generation)) {
+			return false;
+		}
+
 		JMFA_Audit::log('disabled', $user_id);
 
 		self::destroy_sessions($user_id, $keep_current);
+
+		return true;
 	}
 
 	/**

@@ -2,7 +2,7 @@
 /**
  * Bootstrap and lifecycle hooks.
  *
- * Activation only creates the plugin's own tables and a default "off" setting,
+ * Activation creates the plugin's own tables and a default "off" setting,
  * deactivation removes nothing but its own transient login state, so the site
  * behaves exactly as before whenever the plugin is switched off.
  *
@@ -43,6 +43,7 @@ class JMFA_Plugin {
 
 		JMFA_DB::maybe_upgrade();
 		JMFA_Login::init();
+		add_action('deleted_user', array('JMFA_Store', 'delete_user'));
 
 		if (is_admin()) {
 			if (class_exists('JMFA_Admin')) {
@@ -102,9 +103,23 @@ class JMFA_Plugin {
 	 * Deactivation: drop transient login state only. Secrets, recovery codes,
 	 * settings and audit history are kept so re-activation is seamless.
 	 */
-	public static function deactivate() {
-		JMFA_Store::purge_pending();
+	public static function deactivate($network_wide = false) {
 		JMFA_Login::clear_cookie();
-		wp_clear_scheduled_hook('jmfa_prune');
+
+		if (!$network_wide || !is_multisite()) {
+			JMFA_Store::purge_pending();
+			wp_clear_scheduled_hook('jmfa_prune');
+			return;
+		}
+
+		$site_ids = get_sites(array('network_id' => get_current_network_id(), 'fields' => 'ids', 'number' => 0));
+		foreach ($site_ids as $site_id) {
+			switch_to_blog($site_id);
+			if (get_option(JMFA_DB::VERSION_OPTION)) {
+				JMFA_Store::purge_pending();
+				wp_clear_scheduled_hook('jmfa_prune');
+			}
+			restore_current_blog();
+		}
 	}
 }

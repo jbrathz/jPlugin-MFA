@@ -19,9 +19,8 @@ authenticator app (Google Authenticator, Microsoft Authenticator, Authy,
 
 **Scope**
 
-* Only the native WordPress login. The login screens of other plugins
-  (`jPlugin-Member`, `jPlugin-Elearning`, WooCommerce, ...) are not touched,
-  filtered or modified in any way.
+* The interactive MFA prompt runs on the native WordPress login form
+  (`wp-login.php`). Custom login forms can continue to use their existing flow.
 * No dependency: no composer package, no external service, no shared code with
   any other plugin.
 
@@ -41,8 +40,8 @@ authenticator app (Google Authenticator, Microsoft Authenticator, Authy,
   password must be entered again.
 * Audit log with hashed IP / user agent only, pruned automatically after the
   configured retention (90 days by default), and a one click CSV report.
-* Application Passwords and XML-RPC are blocked for users who must use 2FA
-  (switchable for Application Passwords).
+* XML-RPC is blocked for accounts that must use MFA. The Application Passwords
+  option allows or blocks those accounts on the WordPress REST API.
 
 **Privacy**
 
@@ -55,12 +54,18 @@ authenticator app (Google Authenticator, Microsoft Authenticator, Authy,
 == Installation ==
 
 1. Upload the `jPlugin-MFA` folder to `wp-content/plugins/`.
-2. Activate the plugin. Activation only creates two tables and an "off" setting,
-   so the site keeps working exactly as before.
+2. Activate the plugin. Activation creates the plugin tables and starts in "off"
+   mode.
 3. Go to **jPlugin-MFA → การตั้งค่า**, choose "บังคับ" (required) and the roles to
    protect, then save.
-4. Open **jPlugin-MFA → ความปลอดภัยของฉัน** and enrol an authenticator app.
+4. To enrol manually, open **jPlugin-MFA → ความปลอดภัยของฉัน** as an
+   administrator or **โปรไฟล์ → ความปลอดภัยของฉัน** as another user.
    Keep the recovery codes somewhere safe.
+
+Existing authenticator secrets and unused recovery codes carry over on upgrade.
+Restart any MFA login or setup that was in progress during the upgrade.
+On Multisite, uninstall removes shared credentials only when every site with
+plugin data has opted in to removal.
 
 == Frequently Asked Questions ==
 

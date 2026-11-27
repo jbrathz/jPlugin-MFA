@@ -34,13 +34,11 @@ class JMFA_CLI {
 	 * @param array $assoc_args Associative arguments.
 	 */
 	public function status($args, $assoc_args) {
-		$users = get_users(
-			array(
-				'meta_key'   => JMFA_Store::META_STATUS,
-				'meta_value' => 'enabled',
-				'fields'     => array('ID', 'user_login', 'user_email'),
-			)
-		);
+		$ids = JMFA_Store::enabled_user_ids();
+		$users = $ids ? get_users(array(
+			'include' => $ids,
+			'fields'  => array('ID', 'user_login', 'user_email'),
+		)) : array();
 
 		$rows = array();
 
@@ -80,12 +78,12 @@ class JMFA_CLI {
 	public function reset($args) {
 		$user = $this->find_user(isset($args[0]) ? $args[0] : '');
 
-		JMFA_Store::disable($user->ID);
-		JMFA_Audit::log('cli_reset', $user->ID);
-
-		if (class_exists('WP_Session_Tokens')) {
-			WP_Session_Tokens::get_instance($user->ID)->destroy_all();
+		if (!JMFA_Store::disable($user->ID)) {
+			WP_CLI::error('Unable to reset two-factor data.');
 		}
+
+		JMFA_Audit::log('cli_reset', $user->ID);
+		JMFA_Enroll::destroy_sessions($user->ID);
 
 		WP_CLI::success(sprintf('Two-factor removed for %s.', $user->user_login));
 	}

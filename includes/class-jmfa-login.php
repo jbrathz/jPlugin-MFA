@@ -15,17 +15,73 @@ if (!defined('ABSPATH')) {
 class JMFA_Login {
 
 	const COOKIE = 'jmfa_pending';
+	private static $secure_signon = false;
+	private static $remember = false;
 
 	/**
 	 * Register hooks. Called on every request, including wp-login.php.
 	 */
 	public static function init() {
-		add_filter('authenticate', array(__CLASS__, 'gate'), 30, 3);
-		add_action('login_init', array(__CLASS__, 'on_login_init'));
+		add_action('login_form_login', array(__CLASS__, 'on_login_form'));
+		add_action('login_form_logout', array(__CLASS__, 'on_logout_form'));
 		add_action('login_form_jmfa', array(__CLASS__, 'route'));
 		add_action('login_enqueue_scripts', array(__CLASS__, 'enqueue'));
-		add_action('wp_logout', array(__CLASS__, 'on_logout'));
-		add_action('clear_auth_cookie', array(__CLASS__, 'clear_cookie'));
+		add_action('wp_authenticate_application_password_errors', array(__CLASS__, 'check_application_password'), 10, 2);
+
+		if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) {
+			add_filter('authenticate', array(__CLASS__, 'check_xmlrpc'), PHP_INT_MAX);
+		}
+	}
+
+	public static function on_login_form() {
+		if ('POST' === ($_SERVER['REQUEST_METHOD'] ?? '')) {
+			if (!JMFA_Policy::is_disabled() && JMFA_Policy::MODE_OFF !== JMFA_Policy::get('mode')) {
+				add_filter('secure_signon_cookie', array(__CLASS__, 'prepare_signon'), PHP_INT_MAX, 2);
+			}
+			return;
+		}
+
+		self::cancel_pending_from_cookie();
+	}
+
+	public static function prepare_signon($secure, $credentials) {
+		remove_filter('secure_signon_cookie', array(__CLASS__, 'prepare_signon'), PHP_INT_MAX);
+		if ('' !== ($credentials['user_login'] ?? '') && '' !== ($credentials['user_password'] ?? '')) {
+			self::$secure_signon = (bool) $secure;
+			self::$remember = !empty($credentials['remember']);
+			add_filter('authenticate', array(__CLASS__, 'gate'), PHP_INT_MAX);
+		}
+
+		return $secure;
+	}
+
+	public static function check_application_password($error, $user) {
+		$is_rest = defined('REST_REQUEST') && REST_REQUEST;
+		$is_xmlrpc = defined('XMLRPC_REQUEST') && XMLRPC_REQUEST;
+
+		if ((!$is_rest && !$is_xmlrpc) || $error->has_errors() || !JMFA_Policy::requires_gate($user)) {
+			return;
+		}
+
+		if ($is_rest && !$is_xmlrpc && JMFA_Policy::get('allow_app_passwords')) {
+			JMFA_Audit::log('bypass_app_password', $user->ID);
+			return;
+		}
+
+		$error->add('jmfa_required_elsewhere', self::block_non_web($user)->get_error_message());
+	}
+
+	public static function check_xmlrpc($user) {
+		return JMFA_Policy::requires_gate($user) ? self::block_non_web($user) : $user;
+	}
+
+	private static function block_non_web($user) {
+		JMFA_Audit::log('blocked_non_web', $user->ID);
+
+		return new WP_Error(
+			'jmfa_required_elsewhere',
+			__('บัญชีนี้ต้องยืนยันตัวตนสองขั้น กรุณาเข้าสู่ระบบผ่านหน้า wp-login.php', 'jplugin-mfa')
+		);
 	}
 
 	/* ---------------------------------------------------------------------
@@ -33,33 +89,13 @@ class JMFA_Login {
 	 * ------------------------------------------------------------------ */
 
 	/**
-	 * @param WP_User|WP_Error $user     Result of the earlier authenticate callbacks.
-	 * @param string           $username Submitted login.
-	 * @param string           $password Submitted password.
+	 * @param WP_User|WP_Error $user Result of the earlier authenticate callbacks.
 	 * @return WP_User|WP_Error
 	 */
-	public static function gate($user, $username, $password) {
-		if (!($user instanceof WP_User)) {
-			return $user;
-		}
-
+	public static function gate($user) {
+		remove_filter('authenticate', array(__CLASS__, 'gate'), PHP_INT_MAX);
 		if (!JMFA_Policy::requires_gate($user)) {
 			return $user;
-		}
-
-		if (!self::is_core_login_request()) {
-			if (JMFA_Policy::get('allow_app_passwords') && self::is_application_password_request()) {
-				JMFA_Audit::log('bypass_app_password', $user->ID);
-
-				return $user;
-			}
-
-			JMFA_Audit::log('blocked_non_web', $user->ID);
-
-			return new WP_Error(
-				'jmfa_required_elsewhere',
-				__('บัญชีนี้ต้องยืนยันตัวตนสองขั้น กรุณาเข้าสู่ระบบผ่านหน้า wp-login.php', 'jplugin-mfa')
-			);
 		}
 
 		/*
@@ -67,7 +103,7 @@ class JMFA_Login {
 		 * behind a reverse proxy or an office NAT every admin shares one
 		 * address, and a shared bucket would lock everybody out at once.
 		 */
-		$bucket = 'pending|' . strtolower((string) $username) . '|' . JMFA_Audit::client_ip();
+		$bucket = 'pending|' . (int) $user->ID . '|' . JMFA_Audit::client_ip();
 
 		if (!JMFA_Rate_Limit::allow($bucket, 20, 10 * MINUTE_IN_SECONDS)) {
 			JMFA_Audit::log('throttled', $user->ID);
@@ -75,38 +111,39 @@ class JMFA_Login {
 			return new WP_Error('jmfa_throttled', __('คำขอเข้าสู่ระบบมากเกินไป กรุณารอสักครู่แล้วลองใหม่', 'jplugin-mfa'));
 		}
 
-		$stage = JMFA_Store::is_enabled($user->ID) ? 'verify' : 'enroll';
-
-		$redirect = admin_url();
-		if (isset($_REQUEST['redirect_to'])) {
-			$candidate = wp_validate_redirect(wp_unslash($_REQUEST['redirect_to']), '');
-			if ('' !== $candidate) {
-				$redirect = $candidate;
-			}
-		}
-
-		if (!empty($_REQUEST['interim-login'])) {
-			$redirect = add_query_arg('interim-login', 1, $redirect);
-		}
-
-		$pending = JMFA_Store::create_pending($user->ID, $stage, !empty($_POST['rememberme']), $redirect);
-
-		if (!$pending || empty($pending['token'])) {
+		$credential = JMFA_Store::credential($user->ID, true);
+		// Core may have rehashed the password during authentication.
+		$current_user = get_user_by('id', $user->ID);
+		if (!$current_user) {
 			return new WP_Error('jmfa_state', __('เริ่มการยืนยันตัวตนไม่สำเร็จ กรุณาลองเข้าสู่ระบบใหม่', 'jplugin-mfa'));
 		}
 
-		self::set_cookie($pending['token']);
-		JMFA_Audit::log('password_ok', $user->ID, array('stage' => $stage));
+		$requested  = $_REQUEST['redirect_to'] ?? '';
+		$requested  = is_string($requested) && strlen($requested) <= 8192 ? wp_unslash($requested) : '';
+		$redirect   = wp_validate_redirect($requested, admin_url());
+		$context    = array(
+			'requested'  => $requested,
+			'interim'    => isset($_REQUEST['interim-login']),
+			'customizer' => isset($_REQUEST['customize-login']),
+			'secure'     => self::$secure_signon,
+			'password'   => self::password_stamp($current_user),
+		);
+		$pending = $credential
+			? JMFA_Store::create_pending($user->ID, $credential, self::$remember, $redirect, $context)
+			: false;
 
-		$url = add_query_arg('action', 'jmfa', wp_login_url());
+		if (!$pending) {
+			return new WP_Error('jmfa_state', __('เริ่มการยืนยันตัวตนไม่สำเร็จ กรุณาลองเข้าสู่ระบบใหม่', 'jplugin-mfa'));
+		}
 
-		if (!wp_safe_redirect($url)) {
+		if (!self::set_cookie($pending['token']) || !wp_safe_redirect(self::form_url())) {
 			JMFA_Store::delete_pending((int) $pending['id']);
 			self::clear_cookie();
 
 			return new WP_Error('jmfa_redirect', __('เปลี่ยนหน้าไม่สำเร็จ กรุณาลองใหม่', 'jplugin-mfa'));
 		}
 
+		JMFA_Audit::log('password_ok', $user->ID, array('stage' => $pending['stage']));
 		exit;
 	}
 
@@ -149,6 +186,20 @@ class JMFA_Login {
 			return;
 		}
 
+		$credential = JMFA_Store::credential($user->ID);
+		$context    = json_decode((string) ($pending->login_context ?? ''), true);
+		$enrolling  = 'enroll' === $pending->stage;
+
+		if (!$credential || '' === ($pending->generation ?? '') || $credential->generation !== $pending->generation
+			|| $enrolling === ('enabled' === $credential->state)
+			|| !is_string($context['password'] ?? null) || !hash_equals(self::password_stamp($user), $context['password'])
+			|| !JMFA_Policy::requires_gate($user) || is_wp_error(wp_authenticate_spam_check($user))) {
+			self::expire_pending($pending);
+		}
+
+		$pending->context = $context;
+		$GLOBALS['interim_login'] = !empty($context['interim']);
+
 		if (JMFA_Policy::get('bind_ip') && !hash_equals((string) $pending->ip_hash, JMFA_Audit::ip_hash())) {
 			self::discard_pending($pending);
 			JMFA_Audit::log('ip_mismatch', $user->ID);
@@ -161,7 +212,8 @@ class JMFA_Login {
 			return;
 		}
 
-		if ('verify' === $pending->stage && JMFA_Store::is_enabled($user->ID) && false === JMFA_Store::secret($user->ID)) {
+		if ('verify' === $pending->stage && false === JMFA_Crypto::decrypt($credential->secret)
+			&& 0 === JMFA_Store::recovery_remaining($user->ID)) {
 			self::discard_pending($pending);
 			JMFA_Audit::log('secret_unreadable', $user->ID);
 			self::render_message(
@@ -173,7 +225,7 @@ class JMFA_Login {
 			return;
 		}
 
-		if (isset($_SERVER['REQUEST_METHOD']) && 'POST' === strtoupper((string) $_SERVER['REQUEST_METHOD'])) {
+		if ('POST' === ($_SERVER['REQUEST_METHOD'] ?? '')) {
 			self::handle_post($pending, $user);
 
 			return;
@@ -187,7 +239,7 @@ class JMFA_Login {
 	 * @param WP_User $user    User object.
 	 */
 	private static function handle_post($pending, $user) {
-		$nonce = isset($_POST['_wpnonce']) ? sanitize_text_field(wp_unslash($_POST['_wpnonce'])) : '';
+		$nonce = self::post_text('_wpnonce');
 
 		if (!wp_verify_nonce($nonce, 'jmfa_step_' . (int) $pending->id)) {
 			self::render_stage($pending, $user, __('เซสชันไม่ถูกต้อง กรุณาลองใหม่', 'jplugin-mfa'));
@@ -195,24 +247,30 @@ class JMFA_Login {
 			return;
 		}
 
-		$action = isset($_POST['jmfa_action']) ? sanitize_key(wp_unslash($_POST['jmfa_action'])) : 'code';
-
-		if ('finish' === $action) {
-			if ('codes' !== $pending->stage) {
-				self::render_stage($pending, $user, __('ขั้นตอนไม่ถูกต้อง', 'jplugin-mfa'));
-
-				return;
+		$action = sanitize_key(self::post_text('jmfa_action'));
+		if ('codes' === $pending->stage) {
+			if ('finish' === $action) {
+				self::complete_login($pending, $user, 'login_ok');
 			}
+			self::render_stage($pending, $user);
+			return;
+		}
 
-			self::complete_login($pending, $user, 'login_ok');
+		if ('code' !== $action && !('verify' === $pending->stage && 'recovery' === $action)) {
+			self::render_stage($pending, $user, __('ขั้นตอนไม่ถูกต้อง', 'jplugin-mfa'));
+			return;
+		}
 
+		$limit = max(3, (int) JMFA_Policy::get('max_attempts', 5));
+		if (!JMFA_Store::reserve_attempt($pending, $limit)) {
+			self::render_locked();
 			return;
 		}
 
 		if ('recovery' === $action) {
-			$code = isset($_POST['jmfa_recovery']) ? sanitize_text_field(wp_unslash($_POST['jmfa_recovery'])) : '';
+			$code = self::post_text('jmfa_recovery');
 
-			if (JMFA_Store::consume_recovery_code($user->ID, $code)) {
+			if (JMFA_Store::consume_recovery_code($user->ID, $code, $pending->generation)) {
 				JMFA_Audit::log('recovery_used', $user->ID);
 				self::complete_login($pending, $user, 'login_ok_recovery');
 
@@ -224,10 +282,11 @@ class JMFA_Login {
 			return;
 		}
 
-		$code = isset($_POST['jmfa_code']) ? sanitize_text_field(wp_unslash($_POST['jmfa_code'])) : '';
+		$code = self::post_text('jmfa_code');
 
 		if ('enroll' === $pending->stage) {
-			$result = JMFA_Enroll::confirm($user->ID, $code);
+			$secret = JMFA_Crypto::decrypt($pending->setup_secret);
+			$result = JMFA_Enroll::confirm($user->ID, $code, $pending->generation, $secret, $pending);
 
 			if (is_wp_error($result)) {
 				self::register_failure($pending, $user, $result->get_error_message());
@@ -235,40 +294,17 @@ class JMFA_Login {
 				return;
 			}
 
-			JMFA_Store::stash_codes((int) $pending->id, $result);
-			JMFA_Store::set_stage((int) $pending->id, 'codes');
-			JMFA_Store::touch_pending((int) $pending->id, 15 * MINUTE_IN_SECONDS);
-
-			$fresh = JMFA_Store::get_pending_by_id((int) $pending->id);
-
-			self::render_stage($fresh ? $fresh : $pending, $user);
-
-			return;
+			self::set_cookie(self::current_token());
+			self::render_codes($pending, $result);
+			exit;
 		}
 
-		if ('codes' === $pending->stage) {
-			self::render_stage($pending, $user);
-
-			return;
-		}
-
-		$secret = JMFA_Store::secret($user->ID);
-
-		if (false === $secret) {
-			self::render_stage($pending, $user, __('อ่านข้อมูลการยืนยันตัวตนไม่ได้ กรุณาให้ผู้ดูแลระบบรีเซ็ต', 'jplugin-mfa'));
-
-			return;
-		}
-
-		$step = JMFA_TOTP::verify($secret, $code, (int) JMFA_Policy::get('window', 1), JMFA_Store::last_step($user->ID));
-
-		if (false === $step) {
+		if (!JMFA_Store::consume_totp($user->ID, $code, $pending->generation)) {
 			self::register_failure($pending, $user, __('รหัสไม่ถูกต้อง หรือเวลาในอุปกรณ์ไม่ตรงกับเซิร์ฟเวอร์', 'jplugin-mfa'));
 
 			return;
 		}
 
-		JMFA_Store::set_last_step($user->ID, $step);
 		JMFA_Audit::log('verify_ok', $user->ID);
 		self::complete_login($pending, $user, 'login_ok');
 	}
@@ -281,19 +317,19 @@ class JMFA_Login {
 	 * @param string  $message Message to show.
 	 */
 	private static function register_failure($pending, $user, $message) {
-		$attempts = JMFA_Store::bump_attempts((int) $pending->id);
+		$fresh    = JMFA_Store::get_pending_by_id((int) $pending->id);
+		if (!$fresh || $fresh->stage !== $pending->stage) {
+			self::expire_pending();
+		}
+
+		$attempts = (int) $fresh->attempts;
 		$max      = max(3, (int) JMFA_Policy::get('max_attempts', 5));
 
 		JMFA_Audit::log('verify_fail', $user->ID, array('attempts' => $attempts));
 
 		if ($attempts >= $max) {
-			self::discard_pending($pending);
 			JMFA_Audit::log('locked', $user->ID);
-			self::render_message(
-				__('พยายามมากเกินไป', 'jplugin-mfa'),
-				__('กรอกรหัสผิดหลายครั้งเกินไป กรุณาเข้าสู่ระบบใหม่ตั้งแต่ต้น', 'jplugin-mfa'),
-				true
-			);
+			self::render_locked();
 
 			return;
 		}
@@ -317,19 +353,34 @@ class JMFA_Login {
 	 * @param string  $event   Audit event key.
 	 */
 	private static function complete_login($pending, $user, $event) {
-		JMFA_Store::delete_pending((int) $pending->id);
-		JMFA_Store::forget_codes((int) $pending->id);
+		if (!JMFA_Store::claim_pending($pending)) {
+			self::expire_pending();
+		}
+
 		self::clear_cookie();
 
-		$redirect = wp_validate_redirect((string) $pending->redirect_to, admin_url());
+		$context = $pending->context;
+		wp_set_auth_cookie((int) $user->ID, (bool) $pending->remember, !empty($context['secure']));
 
-		wp_set_current_user((int) $user->ID);
-		wp_set_auth_cookie((int) $user->ID, (bool) $pending->remember);
-
-		/** This action is documented in wp-login.php. */
+		/** This action is documented in wp_signon(). */
 		do_action('wp_login', $user->user_login, $user);
 
 		JMFA_Audit::log($event, $user->ID);
+
+		$redirect = apply_filters('login_redirect', $pending->redirect_to, $context['requested'], $user);
+		if (!empty($context['interim'])) {
+			self::render_interim_success(!empty($context['customizer']));
+		}
+
+		if (empty($redirect) || 'wp-admin/' === $redirect || admin_url() === $redirect) {
+			if (is_multisite() && !get_active_blog_for_user($user->ID) && !is_super_admin($user->ID)) {
+				$redirect = user_admin_url();
+			} elseif (is_multisite() && !$user->has_cap('read')) {
+				$redirect = get_dashboard_url($user->ID);
+			} elseif (!$user->has_cap('edit_posts')) {
+				$redirect = $user->has_cap('read') ? admin_url('profile.php') : home_url();
+			}
+		}
 
 		wp_safe_redirect($redirect);
 		exit;
@@ -350,7 +401,7 @@ class JMFA_Login {
 				self::render_enroll($pending, $user, $error);
 				break;
 			case 'codes':
-				self::render_codes($pending, $user);
+				self::render_codes($pending);
 				break;
 			default:
 				self::render_verify($pending, $user, $error);
@@ -440,7 +491,7 @@ class JMFA_Login {
 	 * @param string  $error   Optional error message.
 	 */
 	private static function render_enroll($pending, $user, $error = '') {
-		$secret = JMFA_Enroll::secret_for_user($user->ID);
+		$secret = JMFA_Crypto::decrypt($pending->setup_secret);
 
 		if (false === $secret) {
 			self::render_message(
@@ -507,11 +558,9 @@ class JMFA_Login {
 
 	/**
 	 * @param object  $pending Pending row.
-	 * @param WP_User $user    User object.
+	 * @param array  $codes   Plain codes shown only on the successful setup response.
 	 */
-	private static function render_codes($pending, $user) {
-		$codes = JMFA_Store::take_codes((int) $pending->id);
-
+	private static function render_codes($pending, array $codes = array()) {
 		self::open_page(__('บันทึกรหัสสำรอง', 'jplugin-mfa'));
 
 		if ($codes) {
@@ -583,6 +632,23 @@ class JMFA_Login {
 		}
 	}
 
+	private static function render_interim_success($customizer) {
+		$GLOBALS['interim_login'] = 'success';
+		if ($customizer) {
+			add_action('login_enqueue_scripts', static function () {
+				wp_enqueue_script('customize-base');
+				wp_add_inline_script(
+					'customize-base',
+					'new wp.customize.Messenger({url: ' . wp_json_encode(wp_customize_url(), JSON_HEX_TAG) . ', channel: "login"}).send("login");'
+				);
+			});
+		}
+
+		login_header('', '<p class="message">' . esc_html__('You have logged in successfully.') . '</p>');
+		self::close_page();
+		exit;
+	}
+
 	/* ---------------------------------------------------------------------
 	 * Helpers
 	 * ------------------------------------------------------------------ */
@@ -598,11 +664,23 @@ class JMFA_Login {
 	 * @return object|null Pending row for the current cookie.
 	 */
 	private static function current_pending() {
-		if (empty($_COOKIE[ self::COOKIE ])) {
-			return null;
-		}
+		return JMFA_Store::get_pending(self::current_token());
+	}
 
-		return JMFA_Store::get_pending(sanitize_text_field(wp_unslash($_COOKIE[ self::COOKIE ])));
+	private static function current_token() {
+		$token = $_COOKIE[self::COOKIE] ?? '';
+
+		return is_string($token) ? wp_unslash($token) : '';
+	}
+
+	private static function post_text($key) {
+		$value = $_POST[$key] ?? '';
+
+		return is_string($value) ? sanitize_text_field(wp_unslash($value)) : '';
+	}
+
+	private static function password_stamp($user) {
+		return JMFA_Crypto::hmac('pending-password|' . $user->user_pass);
 	}
 
 	/**
@@ -610,47 +688,25 @@ class JMFA_Login {
 	 */
 	private static function discard_pending($pending) {
 		JMFA_Store::delete_pending((int) $pending->id);
-		JMFA_Store::forget_codes((int) $pending->id);
 		self::clear_cookie();
 	}
 
-	/**
-	 * Only the native login form may start this flow.
-	 *
-	 * @return bool
-	 */
-	private static function is_core_login_request() {
-		if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) {
-			return false;
+	private static function expire_pending($pending = null) {
+		if ($pending) {
+			self::discard_pending($pending);
 		}
 
-		if (defined('REST_REQUEST') && REST_REQUEST) {
-			return false;
-		}
-
-		if (defined('WP_CLI') && WP_CLI) {
-			return false;
-		}
-
-		/*
-		 * wp-login.php fires login_init before it calls wp_signon(), so this is
-		 * the reliable signal that the request really is the native login form.
-		 * $pagenow is only a secondary hint: wp-login.php does not set it.
-		 */
-		if (did_action('login_init') > 0) {
-			return true;
-		}
-
-		$pagenow = isset($GLOBALS['pagenow']) ? (string) $GLOBALS['pagenow'] : '';
-
-		return 'wp-login.php' === $pagenow;
+		self::render_message(
+			__('เซสชันหมดอายุ', 'jplugin-mfa'),
+			__('การยืนยันตัวตนหมดอายุหรือถูกยกเลิก กรุณาเข้าสู่ระบบใหม่', 'jplugin-mfa')
+		);
 	}
 
-	/**
-	 * @return bool
-	 */
-	private static function is_application_password_request() {
-		return !empty($_SERVER['PHP_AUTH_USER']) && isset($_SERVER['PHP_AUTH_PW']);
+	private static function render_locked() {
+		self::render_message(
+			__('พยายามมากเกินไป', 'jplugin-mfa'),
+			__('กรอกรหัสผิดหลายครั้งเกินไป กรุณาเข้าสู่ระบบใหม่ตั้งแต่ต้น', 'jplugin-mfa')
+		);
 	}
 
 	/**
@@ -677,13 +733,14 @@ class JMFA_Login {
 
 	/**
 	 * @param string $token Raw pending token.
+	 * @return bool
 	 */
 	private static function set_cookie($token) {
-		if (headers_sent()) {
-			return;
+		if ('' === $token || headers_sent()) {
+			return false;
 		}
 
-		setcookie(
+		$sent = setcookie(
 			self::COOKIE,
 			(string) $token,
 			array(
@@ -696,7 +753,11 @@ class JMFA_Login {
 			)
 		);
 
-		$_COOKIE[ self::COOKIE ] = (string) $token;
+		if ($sent) {
+			$_COOKIE[ self::COOKIE ] = $token;
+		}
+
+		return $sent;
 	}
 
 	/**
@@ -726,36 +787,24 @@ class JMFA_Login {
 	/**
 	 * Drop a stale pending login as soon as the login form is opened again.
 	 */
-	public static function on_login_init() {
-		$action = isset($_REQUEST['action']) ? sanitize_key(wp_unslash($_REQUEST['action'])) : 'login';
-
-		if ('' === $action) {
-			$action = 'login';
+	private static function cancel_pending_from_cookie() {
+		$token = self::current_token();
+		if ('' !== $token) {
+			JMFA_Store::delete_pending_by_token($token);
+			self::clear_cookie();
 		}
+	}
 
-		if (!in_array($action, array('login', 'logout'), true)) {
-			return;
-		}
-
-		if (!isset($_SERVER['REQUEST_METHOD']) || 'GET' !== strtoupper((string) $_SERVER['REQUEST_METHOD'])) {
-			return;
-		}
-
-		if (empty($_COOKIE[ self::COOKIE ])) {
-			return;
-		}
-
-		JMFA_Store::delete_pending_by_token(sanitize_text_field(wp_unslash($_COOKIE[ self::COOKIE ])));
-		self::clear_cookie();
+	public static function on_logout_form() {
+		self::cancel_pending_from_cookie();
+		add_action('wp_logout', array(__CLASS__, 'on_logout'));
 	}
 
 	/**
 	 * @param int $user_id User ID.
 	 */
 	public static function on_logout($user_id = 0) {
-		self::clear_cookie();
-
-		if ($user_id) {
+		if ($user_id && JMFA_Policy::get('mode') !== JMFA_Policy::MODE_OFF && !JMFA_Policy::is_disabled()) {
 			JMFA_Audit::log('logout', (int) $user_id);
 		}
 	}
@@ -764,7 +813,7 @@ class JMFA_Login {
 	 * Styles and scripts for the second step only.
 	 */
 	public static function enqueue() {
-		$action = isset($_REQUEST['action']) ? sanitize_key(wp_unslash($_REQUEST['action'])) : '';
+		$action = $_REQUEST['action'] ?? '';
 
 		if ('jmfa' !== $action) {
 			return;

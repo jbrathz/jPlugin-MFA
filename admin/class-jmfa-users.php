@@ -84,7 +84,7 @@ class JMFA_Users {
 						<span class="jmfa-badge jmfa-badge-off"><?php esc_html_e('ยังไม่ตั้งค่า', 'jplugin-mfa'); ?></span>
 					<?php endif; ?>
 
-					<?php if ($is_self && current_user_can('manage_options')) : ?>
+						<?php if ($is_self && current_user_can('read')) : ?>
 						<p>
 							<a class="button" href="<?php echo esc_url(JMFA_Admin::tab_url('me')); ?>">
 								<?php esc_html_e('จัดการการยืนยันตัวตนสองขั้น', 'jplugin-mfa'); ?>

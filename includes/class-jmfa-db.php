@@ -2,7 +2,7 @@
 /**
  * Database schema.
  *
- * Two private tables only. No table of any other plugin is read or written.
+ * Plugin-owned pending, audit and credential tables.
  *
  * @package jPlugin-MFA
  */
@@ -15,6 +15,7 @@ class JMFA_DB {
 
 	const PENDING       = 'jmfa_pending';
 	const LOG           = 'jmfa_log';
+	const CREDENTIALS   = 'jmfa_credentials';
 	const VERSION_OPTION = 'jmfa_db_version';
 
 	/**
@@ -25,6 +26,11 @@ class JMFA_DB {
 	 */
 	public static function table($name) {
 		global $wpdb;
+		if (self::CREDENTIALS === $name) {
+			// The legacy credentials are user meta, shared by all sites on a network.
+			return $wpdb->base_prefix . $name;
+		}
+
 		return $wpdb->prefix . $name;
 	}
 
@@ -39,6 +45,7 @@ class JMFA_DB {
 		$charset_collate = $wpdb->get_charset_collate();
 		$pending         = self::table(self::PENDING);
 		$log             = self::table(self::LOG);
+		$credentials     = self::table(self::CREDENTIALS);
 
 		dbDelta(
 			"CREATE TABLE {$pending} (
@@ -47,7 +54,10 @@ class JMFA_DB {
 				user_id bigint(20) unsigned NOT NULL DEFAULT 0,
 				stage varchar(16) NOT NULL DEFAULT 'verify',
 				remember tinyint(1) NOT NULL DEFAULT 0,
-				redirect_to varchar(255) NOT NULL DEFAULT '',
+				redirect_to text NOT NULL,
+				generation char(32) NOT NULL DEFAULT '',
+				setup_secret text NULL,
+				login_context text NULL,
 				ip_hash char(64) NOT NULL DEFAULT '',
 				ua_hash char(64) NOT NULL DEFAULT '',
 				attempts smallint(5) unsigned NOT NULL DEFAULT 0,
@@ -57,7 +67,7 @@ class JMFA_DB {
 				UNIQUE KEY token_hash (token_hash),
 				KEY user_id (user_id),
 				KEY expires_at (expires_at)
-			) {$charset_collate};"
+			) ENGINE=InnoDB {$charset_collate};"
 		);
 
 		dbDelta(
@@ -76,11 +86,31 @@ class JMFA_DB {
 			) {$charset_collate};"
 		);
 
-		update_option(self::VERSION_OPTION, JMFA_DB_VERSION);
+		dbDelta(
+			"CREATE TABLE {$credentials} (
+				user_id bigint(20) unsigned NOT NULL,
+				state varchar(8) NOT NULL DEFAULT '',
+				generation char(32) NOT NULL,
+				secret text NOT NULL,
+				last_step bigint(20) unsigned NOT NULL DEFAULT 0,
+				recovery text NOT NULL,
+				PRIMARY KEY  (user_id),
+				KEY state (state)
+			) ENGINE=InnoDB {$charset_collate};"
+		);
+
+		$columns = $wpdb->get_col("SHOW COLUMNS FROM {$pending}");
+		$engine  = $wpdb->get_row($wpdb->prepare('SHOW TABLE STATUS WHERE Name = %s', $pending));
+		$atomic  = $engine && ('InnoDB' === $engine->Engine || false !== $wpdb->query("ALTER TABLE {$pending} ENGINE=InnoDB"));
+
+		if ($atomic && self::table_exists(self::CREDENTIALS) && self::table_exists(self::LOG)
+			&& !array_diff(array('generation', 'setup_secret', 'login_context'), $columns)) {
+			update_option(self::VERSION_OPTION, JMFA_DB_VERSION);
+		}
 	}
 
 	/**
-	 * Run the installer when the stored schema version differs or a table is missing.
+	 * Run the installer when the stored schema version differs.
 	 */
 	public static function maybe_upgrade() {
 		if (get_option(self::VERSION_OPTION) === JMFA_DB_VERSION) {

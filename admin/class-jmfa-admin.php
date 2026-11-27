@@ -12,6 +12,7 @@ if (!defined('ABSPATH')) {
 class JMFA_Admin {
 
 	const SLUG = 'jmfa';
+	const SELF_SLUG = 'jmfa-me';
 
 	/**
 	 * Register hooks.
@@ -32,6 +33,18 @@ class JMFA_Admin {
 	}
 
 	public static function menu() {
+		if (!current_user_can('manage_options')) {
+			add_submenu_page(
+				'profile.php',
+				__('ความปลอดภัยของฉัน', 'jplugin-mfa'),
+				__('ความปลอดภัยของฉัน', 'jplugin-mfa'),
+				'read',
+				self::SELF_SLUG,
+				array(__CLASS__, 'render_self')
+			);
+			return;
+		}
+
 		add_menu_page(
 			__('jPlugin-MFA', 'jplugin-mfa'),
 			__('jPlugin-MFA', 'jplugin-mfa'),
@@ -47,7 +60,8 @@ class JMFA_Admin {
 	 * @param string $hook Current admin page hook.
 	 */
 	public static function assets($hook) {
-		if ('toplevel_page_' . self::SLUG !== $hook) {
+		if (!in_array($hook, array('toplevel_page_' . self::SLUG, 'profile_page_' . self::SELF_SLUG,
+			'users_page_' . self::SELF_SLUG, 'admin_page_' . self::SELF_SLUG), true)) {
 			return;
 		}
 
@@ -87,6 +101,15 @@ class JMFA_Admin {
 				self::render_settings();
 		}
 
+		echo '</div>';
+	}
+
+	public static function render_self() {
+		self::require_self_access();
+		echo '<div class="wrap jmfa-wrap">';
+		echo '<h1>' . esc_html__('jPlugin-MFA — การยืนยันตัวตนสองขั้น', 'jplugin-mfa') . '</h1>';
+		self::render_messages();
+		self::render_me();
 		echo '</div>';
 	}
 
@@ -131,6 +154,7 @@ class JMFA_Admin {
 			'unlocked'       => array('success', __('ล้างการเข้าสู่ระบบที่ค้างอยู่แล้ว', 'jplugin-mfa')),
 			'error'          => array('error', __('ทำรายการไม่สำเร็จ กรุณาลองใหม่', 'jplugin-mfa')),
 			'code_error'     => array('error', __('รหัสไม่ถูกต้อง หรือเวลาในอุปกรณ์ไม่ตรงกับเซิร์ฟเวอร์', 'jplugin-mfa')),
+			'codes_missing'  => array('warning', __('บันทึกการเปลี่ยนแปลงแล้ว แต่แสดงรหัสสำรองไม่ได้ กรุณาสร้างชุดใหม่จากหน้านี้', 'jplugin-mfa')),
 		);
 
 		if (!isset($texts[ $message ])) {
@@ -231,7 +255,7 @@ class JMFA_Admin {
 					<td>
 						<label>
 							<input type="checkbox" name="jmfa_allow_app_passwords" value="1" <?php checked(!empty($settings['allow_app_passwords'])); ?> />
-							<?php esc_html_e('ยอมให้ Application Password ข้ามการยืนยันสองขั้น', 'jplugin-mfa'); ?>
+						<?php esc_html_e('ยอมให้บัญชีที่ต้องใช้ MFA ใช้ Application Password ผ่าน REST API', 'jplugin-mfa'); ?>
 						</label>
 						<p class="description"><?php esc_html_e('ถ้าไม่ติ๊ก ผู้ใช้ที่ถูกบังคับ MFA จะใช้ Application Password ไม่ได้ (ปิดช่องทางที่ข้าม MFA ได้) — XML-RPC ถูกบล็อกเสมอเมื่อบังคับ MFA', 'jplugin-mfa'); ?></p>
 					</td>
@@ -296,12 +320,14 @@ class JMFA_Admin {
 		}
 
 		$enabled = JMFA_Store::is_enabled($user_id);
-		$setup   = JMFA_Enroll::peek_secret($user_id);
+		$setup   = JMFA_Enroll::admin_setup($user_id);
 		$confirm = isset($_GET['step']) && 'confirm' === sanitize_key(wp_unslash($_GET['step'])) && false !== $setup;
 		$codes   = array();
 
-		if (isset($_GET['codes'])) {
-			$stored = get_transient('jmfa_admin_codes_' . $user_id);
+		$nonce = $_GET['codes'] ?? '';
+		if (is_string($nonce) && wp_verify_nonce(sanitize_text_field(wp_unslash($nonce)), 'jmfa_show_codes')) {
+			$key = self::codes_key($user_id);
+			$stored = '' === $key ? false : get_transient($key);
 
 			if ($stored) {
 				$plain = JMFA_Crypto::decrypt($stored);
@@ -314,7 +340,7 @@ class JMFA_Admin {
 					}
 				}
 
-				delete_transient('jmfa_admin_codes_' . $user_id);
+				delete_transient($key);
 			}
 		}
 		?>
@@ -362,7 +388,7 @@ class JMFA_Admin {
 		?>
 
 		<?php if ($confirm) : ?>
-			<?php $secret = $setup; $uri = JMFA_Enroll::provisioning_uri($user, $secret); ?>
+			<?php $secret = $setup['secret']; $uri = JMFA_Enroll::provisioning_uri($user, $secret); ?>
 			<h3><?php esc_html_e('สแกน QR แล้วยืนยัน', 'jplugin-mfa'); ?></h3>
 			<div class="jmfa-qr" data-jmfa-qr="<?php echo esc_attr($uri); ?>"></div>
 			<p class="jmfa-secret">
@@ -419,13 +445,7 @@ class JMFA_Admin {
 	 * ------------------------------------------------------------------ */
 
 	private static function render_users() {
-		$enabled_ids = get_users(
-			array(
-				'meta_key'   => JMFA_Store::META_STATUS,
-				'meta_value' => 'enabled',
-				'fields'     => 'ID',
-			)
-		);
+		$enabled_ids = JMFA_Store::enabled_user_ids();
 
 		$role_ids = get_users(
 			array(
@@ -463,6 +483,7 @@ class JMFA_Admin {
 				}
 
 				$is_on = JMFA_Store::is_enabled($id);
+			$can_manage = self::can_manage_user($id);
 				?>
 				<tr>
 					<td>
@@ -478,7 +499,7 @@ class JMFA_Admin {
 						<?php endif; ?>
 					</td>
 					<td>
-						<?php if ($is_on) : ?>
+						<?php if ($can_manage && $is_on && $id !== get_current_user_id()) : ?>
 							<form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="jmfa-inline-form">
 								<input type="hidden" name="action" value="jmfa_reset_user" />
 								<input type="hidden" name="user_id" value="<?php echo esc_attr($id); ?>" />
@@ -489,14 +510,16 @@ class JMFA_Admin {
 								</button>
 							</form>
 						<?php endif; ?>
-						<form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="jmfa-inline-form">
-							<input type="hidden" name="action" value="jmfa_unlock_user" />
-							<input type="hidden" name="user_id" value="<?php echo esc_attr($id); ?>" />
-							<?php wp_nonce_field('jmfa_unlock_user_' . $id); ?>
-							<button type="submit" class="button button-small">
-								<?php esc_html_e('ล้างที่ค้างอยู่', 'jplugin-mfa'); ?>
-							</button>
-						</form>
+						<?php if ($can_manage) : ?>
+							<form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" class="jmfa-inline-form">
+								<input type="hidden" name="action" value="jmfa_unlock_user" />
+								<input type="hidden" name="user_id" value="<?php echo esc_attr($id); ?>" />
+								<?php wp_nonce_field('jmfa_unlock_user_' . $id); ?>
+								<button type="submit" class="button button-small">
+									<?php esc_html_e('ล้างที่ค้างอยู่', 'jplugin-mfa'); ?>
+								</button>
+							</form>
+						<?php endif; ?>
 					</td>
 				</tr>
 			<?php endforeach; ?>
@@ -608,16 +631,12 @@ class JMFA_Admin {
 	}
 
 	public static function handle_start_enroll() {
-		if (!current_user_can('manage_options')) {
-			wp_die(esc_html__('ไม่มีสิทธิ์', 'jplugin-mfa'));
-		}
-
+		self::require_self_access(true);
 		check_admin_referer('jmfa_start_enroll');
 
 		$user_id = get_current_user_id();
-		JMFA_Store::forget_setup($user_id);
 
-		if (false === JMFA_Enroll::secret_for_user($user_id)) {
+		if (!JMFA_Enroll::start($user_id)) {
 			self::redirect('me', 'error');
 		}
 
@@ -625,112 +644,87 @@ class JMFA_Admin {
 	}
 
 	public static function handle_confirm_enroll() {
-		if (!current_user_can('manage_options')) {
-			wp_die(esc_html__('ไม่มีสิทธิ์', 'jplugin-mfa'));
-		}
-
+		self::require_self_access(true);
 		check_admin_referer('jmfa_confirm_enroll');
 
 		$user_id = get_current_user_id();
-		$code    = isset($_POST['jmfa_code']) ? sanitize_text_field(wp_unslash($_POST['jmfa_code'])) : '';
-		$result  = JMFA_Enroll::confirm($user_id, $code);
+		$setup   = JMFA_Enroll::admin_setup($user_id);
+
+		if (!$setup || !self::allow_code_attempt($user_id)) {
+			self::redirect('me', 'error');
+		}
+
+		$result = JMFA_Enroll::confirm($user_id, self::submitted_code(), $setup['generation'], $setup['secret']);
 
 		if (is_wp_error($result)) {
 			self::redirect('me', 'code_error', array('step' => 'confirm'));
 		}
 
-		set_transient(
-			'jmfa_admin_codes_' . $user_id,
-			JMFA_Crypto::encrypt(wp_json_encode(array_values($result))),
-			15 * MINUTE_IN_SECONDS
-		);
-
-		self::redirect('me', 'enrolled', array('codes' => 1));
+		JMFA_Enroll::finish_admin_setup($user_id);
+		self::show_codes($user_id, $result, 'enrolled');
 	}
 
 	public static function handle_regen() {
-		if (!current_user_can('manage_options')) {
-			wp_die(esc_html__('ไม่มีสิทธิ์', 'jplugin-mfa'));
-		}
-
+		self::require_self_access(true);
 		check_admin_referer('jmfa_regen');
 
-		$user_id = get_current_user_id();
-		$code    = isset($_POST['jmfa_code']) ? sanitize_text_field(wp_unslash($_POST['jmfa_code'])) : '';
+		$user_id    = get_current_user_id();
+		$generation = self::verify_current_code($user_id, self::submitted_code());
 
-		if (!self::verify_current_code($user_id, $code)) {
+		if (false === $generation) {
 			self::redirect('me', 'code_error');
 		}
 
 		$codes = JMFA_Store::generate_recovery_codes();
-		JMFA_Store::store_recovery_codes($user_id, $codes);
+		if (!JMFA_Store::store_recovery_codes($user_id, $codes, $generation)) {
+			self::redirect('me', 'error');
+		}
+
 		JMFA_Audit::log('recovery_regenerated', $user_id);
-
-		set_transient(
-			'jmfa_admin_codes_' . $user_id,
-			JMFA_Crypto::encrypt(wp_json_encode(array_values($codes))),
-			15 * MINUTE_IN_SECONDS
-		);
-
-		self::redirect('me', 'regen', array('codes' => 1));
+		self::show_codes($user_id, $codes, 'regen');
 	}
 
 	public static function handle_disable() {
-		if (!current_user_can('manage_options')) {
-			wp_die(esc_html__('ไม่มีสิทธิ์', 'jplugin-mfa'));
-		}
-
+		self::require_self_access(true);
 		check_admin_referer('jmfa_disable');
 
-		$user_id = get_current_user_id();
-		$code    = isset($_POST['jmfa_code']) ? sanitize_text_field(wp_unslash($_POST['jmfa_code'])) : '';
+		$user_id    = get_current_user_id();
+		$generation = self::verify_current_code($user_id, self::submitted_code());
 
-		if (!self::verify_current_code($user_id, $code)) {
+		if (false === $generation) {
 			self::redirect('me', 'code_error');
 		}
 
-		JMFA_Enroll::disable($user_id, true);
+		if (!JMFA_Enroll::disable($user_id, true, $generation)) {
+			self::redirect('me', 'error');
+		}
 
 		self::redirect('me', 'disabled');
 	}
 
 	public static function handle_reset_user() {
-		if (!current_user_can('manage_options')) {
+		$target = self::posted_user_id();
+		if (!self::can_manage_user($target) || $target === get_current_user_id()) {
 			wp_die(esc_html__('ไม่มีสิทธิ์', 'jplugin-mfa'));
 		}
 
-		$target = isset($_POST['user_id']) ? (int) $_POST['user_id'] : 0;
-
 		check_admin_referer('jmfa_reset_user_' . $target);
 
-		$user = get_userdata($target);
-
-		if (!$user) {
+		if (!get_userdata($target) || !JMFA_Store::disable($target)) {
 			self::redirect('users', 'error');
 		}
 
-		JMFA_Store::disable($target);
 		JMFA_Audit::log('admin_reset', $target, array('by' => get_current_user_id()));
-
-		if (class_exists('WP_Session_Tokens')) {
-			$manager = WP_Session_Tokens::get_instance($target);
-
-			if ($target === get_current_user_id()) {
-				$manager->destroy_others(wp_get_session_token());
-			} else {
-				$manager->destroy_all();
-			}
-		}
+		JMFA_Enroll::destroy_sessions($target);
 
 		self::redirect('users', 'reset');
 	}
 
 	public static function handle_unlock_user() {
-		if (!current_user_can('manage_options')) {
+		$target = self::posted_user_id();
+		if (!self::can_manage_user($target)) {
 			wp_die(esc_html__('ไม่มีสิทธิ์', 'jplugin-mfa'));
 		}
-
-		$target = isset($_POST['user_id']) ? (int) $_POST['user_id'] : 0;
 
 		check_admin_referer('jmfa_unlock_user_' . $target);
 
@@ -818,6 +812,50 @@ class JMFA_Admin {
 		exit;
 	}
 
+	private static function require_self_access($post = false) {
+		if (!get_current_user_id() || !current_user_can('read') || ($post && 'POST' !== ($_SERVER['REQUEST_METHOD'] ?? ''))) {
+			wp_die(esc_html__('ไม่มีสิทธิ์', 'jplugin-mfa'));
+		}
+	}
+
+	private static function posted_user_id() {
+		$id = $_POST['user_id'] ?? '';
+
+		return is_string($id) && ctype_digit($id) ? (int) $id : 0;
+	}
+
+	private static function can_manage_user($user_id) {
+		return $user_id > 0 && current_user_can('manage_options') && current_user_can('edit_user', $user_id)
+			&& (!is_multisite() || is_user_member_of_blog($user_id));
+	}
+
+	private static function submitted_code() {
+		$code = $_POST['jmfa_code'] ?? '';
+
+		return is_string($code) ? sanitize_text_field(wp_unslash($code)) : '';
+	}
+
+	private static function allow_code_attempt($user_id) {
+		return JMFA_Rate_Limit::allow('manage|' . (int) $user_id, 10, 5 * MINUTE_IN_SECONDS);
+	}
+
+	private static function codes_key($user_id) {
+		$token = wp_get_session_token();
+
+		return '' === $token ? '' : 'jmfa_admin_codes_' . (int) $user_id . '_' . hash('sha256', $token);
+	}
+
+	private static function show_codes($user_id, array $codes, $message) {
+		$key    = self::codes_key($user_id);
+		$sealed = JMFA_Crypto::encrypt(wp_json_encode($codes));
+
+		if ('' === $key || false === $sealed || !set_transient($key, $sealed, 15 * MINUTE_IN_SECONDS)) {
+			self::redirect('me', 'codes_missing');
+		}
+
+		self::redirect('me', $message, array('codes' => wp_create_nonce('jmfa_show_codes')));
+	}
+
 	/**
 	 * Neutralise spreadsheet formulas in a CSV cell.
 	 *
@@ -878,25 +916,26 @@ class JMFA_Admin {
 	/**
 	 * @param int    $user_id User ID.
 	 * @param string $code    Six digit code or recovery code.
-	 * @return bool
+	 * @return string|false Generation of the credential that accepted the code.
 	 */
 	private static function verify_current_code($user_id, $code) {
-		$secret = JMFA_Store::secret($user_id);
-
-		if (false !== $secret) {
-			$step = JMFA_TOTP::verify($secret, $code, (int) JMFA_Policy::get('window', 1), JMFA_Store::last_step($user_id));
-
-			if (false !== $step) {
-				JMFA_Store::set_last_step($user_id, $step);
-
-				return true;
-			}
+		if (!self::allow_code_attempt($user_id)) {
+			return false;
 		}
 
-		if (JMFA_Store::consume_recovery_code($user_id, $code)) {
+		$row = JMFA_Store::credential($user_id, true);
+		if (!$row || 'enabled' !== $row->state) {
+			return false;
+		}
+
+		if (JMFA_Store::consume_totp($user_id, $code, $row->generation)) {
+			return $row->generation;
+		}
+
+		if (JMFA_Store::consume_recovery_code($user_id, $code, $row->generation)) {
 			JMFA_Audit::log('recovery_used', $user_id);
 
-			return true;
+			return $row->generation;
 		}
 
 		JMFA_Audit::log('verify_fail', $user_id, array('where' => 'admin'));
@@ -926,6 +965,10 @@ class JMFA_Admin {
 	 * @return string
 	 */
 	public static function tab_url($tab) {
+		if ('me' === $tab && !current_user_can('manage_options')) {
+			return add_query_arg('page', self::SELF_SLUG, admin_url('profile.php'));
+		}
+
 		return add_query_arg(
 			array(
 				'page' => self::SLUG,
@@ -941,19 +984,11 @@ class JMFA_Admin {
 	 * @param array  $extra   Extra query args.
 	 */
 	private static function redirect($tab, $message = '', array $extra = array()) {
-		$args = array_merge(
-			array(
-				'page' => self::SLUG,
-				'tab'  => $tab,
-			),
-			$extra
-		);
-
 		if ('' !== $message) {
-			$args['jmfa_msg'] = $message;
+			$extra['jmfa_msg'] = $message;
 		}
 
-		wp_safe_redirect(add_query_arg($args, admin_url('admin.php')));
+		wp_safe_redirect(add_query_arg($extra, self::tab_url($tab)));
 		exit;
 	}
 }

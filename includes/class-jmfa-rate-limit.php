@@ -23,14 +23,19 @@ class JMFA_Rate_Limit {
 		$name = 'jmfa_rl_' . md5((string) $key);
 		$data = get_transient($name);
 
-		if (!is_array($data) || !isset($data['count'])) {
-			$data = array('count' => 0);
+		$now = time();
+		if (!is_array($data) || !isset($data['count'], $data['expires']) || $data['expires'] <= $now) {
+			$data = array('count' => 0, 'expires' => $now + max(60, (int) $window));
+		}
+
+		if ($data['count'] >= (int) $limit) {
+			return false;
 		}
 
 		$data['count']++;
-		set_transient($name, $data, max(60, (int) $window));
+		set_transient($name, $data, $data['expires'] - $now);
 
-		return $data['count'] <= (int) $limit;
+		return true;
 	}
 
 	/**

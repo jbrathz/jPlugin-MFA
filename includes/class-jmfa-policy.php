@@ -131,7 +131,12 @@ class JMFA_Policy {
 			return false;
 		}
 
-		if (JMFA_Store::is_enabled($user->ID)) {
+		$status = JMFA_Store::status($user->ID);
+		if ('unavailable' === $status) {
+			return true;
+		}
+
+		if ('enabled' === $status) {
 			return (bool) apply_filters('jmfa_user_requires_mfa', true, $user);
 		}
 
