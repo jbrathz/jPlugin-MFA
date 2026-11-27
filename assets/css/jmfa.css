@@ -1,0 +1,108 @@
+/* jPlugin-MFA — shared styles for the login interstitial and the admin screen. */
+
+.jmfa-qr {
+	max-width: 220px;
+	margin: 14px 0;
+	padding: 12px;
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	line-height: 0;
+}
+
+.jmfa-qr svg {
+	display: block;
+	width: 100%;
+	height: auto;
+}
+
+.login .jmfa-qr {
+	margin-left: auto;
+	margin-right: auto;
+}
+
+.jmfa-secret {
+	margin: 12px 0;
+}
+
+.jmfa-secret code {
+	display: inline-block;
+	padding: 6px 8px;
+	background: #f0f0f1;
+	border-radius: 3px;
+	letter-spacing: 1px;
+	word-break: break-all;
+	color: #1d2327;
+	font-size: 13px;
+}
+
+.jmfa-codes {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 6px 18px;
+	margin: 12px 0;
+	padding: 0;
+	list-style: none;
+}
+
+.jmfa-codes code {
+	font-size: 14px;
+	letter-spacing: 1px;
+}
+
+.jmfa-hint {
+	margin-top: 10px;
+	color: #646970;
+	font-size: 12px;
+}
+
+.jmfa-details {
+	margin-top: 12px;
+}
+
+.jmfa-details summary {
+	cursor: pointer;
+	color: #2271b1;
+}
+
+.login .jmfa-hint {
+	text-align: center;
+}
+
+.jmfa-badge {
+	display: inline-block;
+	padding: 2px 8px;
+	border-radius: 10px;
+	font-size: 12px;
+	line-height: 1.6;
+}
+
+.jmfa-badge-on {
+	background: #edfaef;
+	border: 1px solid #b8e6c1;
+	color: #0a6b21;
+}
+
+.jmfa-badge-off {
+	background: #f6f7f7;
+	border: 1px solid #dcdcde;
+	color: #646970;
+}
+
+.jmfa-wrap .jmfa-inline-form {
+	display: inline-block;
+	margin: 0 6px 0 0;
+	vertical-align: middle;
+}
+
+.jmfa-wrap .jmfa-inline-form input[type="text"] {
+	width: 200px;
+}
+
+.jmfa-wrap table.jmfa-log code {
+	font-size: 12px;
+}
+
+.jmfa-wrap .jmfa-codes {
+	max-width: 460px;
+}
