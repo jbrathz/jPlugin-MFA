@@ -12,6 +12,20 @@ Two-factor authentication (TOTP) for the native WordPress login. Google Authenti
 
 == Description ==
 
+**การใช้งาน**
+
+jPlugin-MFA เพิ่มการยืนยันตัวตนสองขั้นให้หน้าเข้าสู่ระบบ WordPress
+เมื่อติดตั้งและเปิดปลั๊กอิน ระบบจะเริ่มในโหมดปิด ผู้ดูแลเปิด MFA และกำหนด
+บทบาทที่ต้องยืนยันได้จากเมนู **jPlugin-MFA → การตั้งค่า**
+
+ทดสอบแล้วกับ WordPress แบบไซต์เดียว ทั้งการตั้งค่า MFA การเข้าสู่ระบบด้วย
+Authenticator และการใช้รหัสสำรองเดิมหลังอัปเกรด ส่วน Multisite
+และการเข้าสู่ระบบพร้อมกันยังไม่ได้ทดสอบบนระบบจริง
+
+หน้าจอยืนยัน MFA ทำงานกับหน้าเข้าสู่ระบบมาตรฐานของ WordPress
+(`wp-login.php`) หากเว็บใช้หน้าล็อกอินของปลั๊กอินอื่น ให้ตรวจสอบขอบเขตนี้
+ก่อนเปิดใช้กับผู้ใช้จริง
+
 jPlugin-MFA adds a second step to the normal WordPress login form (`wp-login.php`).
 After the password is accepted, the user must enter a 6 digit code from an
 authenticator app (Google Authenticator, Microsoft Authenticator, Authy,
